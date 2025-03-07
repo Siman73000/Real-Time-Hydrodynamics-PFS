@@ -34,6 +34,8 @@ Look Right:        "Right Arrow Key"
 
 Look Up:           "Up Arrow Key"
 
-Look Down"         "Down Arrow Key"
+Look Down:         "Down Arrow Key"
 
-Restart Sim"       "Enter"
+Restart Sim:       "Enter"
+
+Open Menu:         "f"
