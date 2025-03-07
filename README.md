@@ -9,7 +9,7 @@ To build this project perform the following commands in the build directory (wit
 
 "sudo apt update && sudo apt install -y gcc libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev libglfw3-dev"
 
-"gcc -o main main.c -lGL -lGLU -lglut -lm -lglfw -O3 -ffast-math"
+"gcc main.c pfs.c -o main -lGL -lGLU -lglut -lm -lglfw -O3 -ffast-math"
 
 
 ## Code Architecture
