@@ -2,10 +2,13 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <time.h>
+#include <string.h>
+#include <stdio.h>
 #include "fast_sqrt.h"
-#include "particles.h"
 #include "pfs.h"
-
+#include "octree.h"
+#include "particles.h"
 
 bool showMenu = false;
 int particleCount = 500;
@@ -22,6 +25,7 @@ int numSpheres = 0;
 float camDist = 15.0f;
 float camAngleX = 30.0f, camAngleY = 30.0f;
 bool isDragging = false;
+bool toggle = false;
 GLfloat lightPos[] = {5.0f, 10.0f, 5.0f, 1.0f};
 
 // Global maximum velocity used for color interpolation
@@ -31,7 +35,8 @@ float MAX_VELOCITY = -0.001f;
 GLuint sphereList;
 
 void initializeSpheres() {
-    int count = particleCount;  
+    int count = particleCount;
+
     // Compute the grid dimension as the cube root (rounded up)
     int gridDim = (int)ceil(pow((double)particleCount, 1.0 / 3.0));
     // Center the grid around the origin
@@ -54,8 +59,8 @@ void initializeSpheres() {
     }
 }
 
-/*  Update sphere position/velocity using velocity Verlet integration.
-    Gravity is the only acceleration, and the y-component update is done via inline assembly. */
+/* Update sphere position/velocity using velocity Verlet integration.
+   Gravity is the only acceleration, and the y-component update is done via inline assembly. */
 void updateSphere(Sphere* s, float dt) {
     // Acceleration (only gravity on y)
     float ax = 0.0f, ay = GRAVITY, az = 0.0f;
@@ -64,7 +69,7 @@ void updateSphere(Sphere* s, float dt) {
     s->y += s->vy * dt + 0.5f * ay * dt * dt;
     s->z += s->vz * dt + 0.5f * az * dt * dt;
     
-    // Update velocity: for y-component, use inline assembly (vx and vz remain unchanged)
+    // Update velocity: for y-component, using inline assembly.
     float old_vy = s->vy;
     float dt_val = dt;
     float gravity_val = GRAVITY;
@@ -72,22 +77,18 @@ void updateSphere(Sphere* s, float dt) {
         "movss %1, %%xmm0\n\t"   // xmm0 = gravity_val
         "mulss %2, %%xmm0\n\t"   // xmm0 = gravity_val * dt
         "addss %3, %%xmm0\n\t"   // xmm0 = old_vy + (gravity_val * dt)
-        "movss %%xmm0, %0\n\t"   // store back into s->vy
+        "movss %%xmm0, %0\n\t"   // store result back into s->vy
         : "=m" (s->vy)
         : "x" (gravity_val), "x" (dt_val), "x" (old_vy)
         : "xmm0"
     );
 }
 
-void clearGrid() {
-    for (int i = 0; i < GRID_RES; i++) {
-        for (int j = 0; j < GRID_RES; j++) {
-            for (int k = 0; k < GRID_RES; k++) {
-                grid[i][j][k].count = 0;
-            }
-        }
-    }
-}
+/* ---------------------------------------------------------------------------
+   Removed grid-based spatial partitioning functions:
+   clearGrid(), buildSpatialGrid(), and the associated spatial hash globals
+   have been removed in favor of using the octree approach defined in octree.h.
+   --------------------------------------------------------------------------- */
 
 // Utility: Compute a ray (origin & direction) from the current mouse position.
 void computeRay(int x, int y, float rayOrigin[3], float rayDir[3]) {
@@ -129,8 +130,8 @@ bool intersectRayPlane(const float rayOrigin[3], const float rayDir[3],
     if (fabs(denom) < 1e-6)
         return false;
     float t = ((planePoint[0]-rayOrigin[0])*planeNormal[0] +
-            (planePoint[1]-rayOrigin[1])*planeNormal[1] +
-            (planePoint[2]-rayOrigin[2])*planeNormal[2]) / denom;
+               (planePoint[1]-rayOrigin[1])*planeNormal[1] +
+               (planePoint[2]-rayOrigin[2])*planeNormal[2]) / denom;
     if (t < 0)
         return false;
     intersection[0] = rayOrigin[0] + rayDir[0]*t;
@@ -139,110 +140,36 @@ bool intersectRayPlane(const float rayOrigin[3], const float rayDir[3],
     return true;
 }
 
-// Insert each sphere index into the appropriate cell in the grid
-void buildSpatialGrid() {
-    clearGrid();
-    for (int index = 0; index < numSpheres; index++) {
-        Sphere *s = &spheres[index];
-        int ix = (int)((s->x + BOUNDARY) / CELL_SIZE);
-        int iy = (int)((s->y + BOUNDARY) / CELL_SIZE);
-        int iz = (int)((s->z + BOUNDARY) / CELL_SIZE);
-        if (ix < 0) ix = 0; if (ix >= GRID_RES) ix = GRID_RES - 1;
-        if (iy < 0) iy = 0; if (iy >= GRID_RES) iy = GRID_RES - 1;
-        if (iz < 0) iz = 0; if (iz >= GRID_RES) iz = GRID_RES - 1;
-        GridCell *cell = &grid[ix][iy][iz];
-        if (cell->count < MAX_SPHERES_PER_CELL) {
-            cell->indices[cell->count++] = index;
+Item* linearSearch(Item* item, size_t size, const char* velocities) {
+    for (size_t i = 0; i < size; i++) {
+        if (strcmp(item[i].velocities, velocities) == 0) {
+            return &item[i];
         }
     }
+    return NULL;
 }
 
-/*  Resolve collisions using spatial partitioning.
-    Only spheres in the same or neighboring grid cells are checked. */
-void resolveCollisionsSpatial() {
-    buildSpatialGrid();
-    for (int ix = 0; ix < GRID_RES; ix++) {
-        for (int iy = 0; iy < GRID_RES; iy++) {
-            for (int iz = 0; iz < GRID_RES; iz++) {
-                GridCell *cell = &grid[ix][iy][iz];
-
-                for (int a = 0; a < cell->count; a++) {
-                    int indexA = cell->indices[a];
-                    Sphere *sA = &spheres[indexA];
-
-                    // Check against all neighbors (including same cell)
-                    for (int dx = -1; dx <= 1; dx++) {
-                        int nx = ix + dx;
-                        if (nx < 0 || nx >= GRID_RES) continue;
-
-                        for (int dy = -1; dy <= 1; dy++) {
-                            int ny = iy + dy;
-                            if (ny < 0 || ny >= GRID_RES) continue;
-
-                            for (int dz = -1; dz <= 1; dz++) {
-                                int nz = iz + dz;
-                                if (nz < 0 || nz >= GRID_RES) continue;
-                                GridCell *neighbor = &grid[nx][ny][nz];
-
-                                for (int b = 0; b < neighbor->count; b++) {
-                                    int indexB = neighbor->indices[b];
-                                    // Avoid double-checking the same pair.
-                                    if (indexB <= indexA) {
-                                        continue;
-                                    }
-
-                                    Sphere *sB = &spheres[indexB];
-                                    float dx = sB->x - sA->x;
-                                    float dy = sB->y - sA->y;
-                                    float dz = sB->z - sA->z;
-                                    float dist = fast_sqrt(dx*dx + dy*dy + dz*dz);
-                                    float minDist = 2 * SPHERE_RADIUS;
-                                    if (dist < minDist && dist > 0.0f) {
-
-                                        // Normalize and compute overlap
-                                        float nx = dx / dist;
-                                        float ny = dy / dist;
-                                        float nz = dz / dist;
-                                        float overlap = minDist - dist;
-                                        sA->x -= nx * overlap * 0.5f;
-                                        sA->y -= ny * overlap * 0.5f;
-                                        sA->z -= nz * overlap * 0.5f;
-                                        sB->x += nx * overlap * 0.5f;
-                                        sB->y += ny * overlap * 0.5f;
-                                        sB->z += nz * overlap * 0.5f;
-                                        
-                                        // Compute relative velocity along the normal
-                                        float vx_rel = sB->vx - sA->vx;
-                                        float vy_rel = sB->vy - sA->vy;
-                                        float vz_rel = sB->vz - sA->vz;
-                                        float velAlongNormal = vx_rel * nx + vy_rel * ny + vz_rel * nz;
-                                        if (velAlongNormal > 0) {
-                                            continue;
-                                        }
-                                        float impulse = -(1 + RESTITUTION) * velAlongNormal / 2.0f;
-                                        sA->vx -= impulse * nx;
-                                        sA->vy -= impulse * ny;
-                                        sA->vz -= impulse * nz;
-                                        sB->vx += impulse * nx;
-                                        sB->vy += impulse * ny;
-                                        sB->vz += impulse * nz;
-                                        
-                                        // Update MAX_VELOCITY for color interpolation
-                                        float velA = fast_sqrt(sA->vx*sA->vx + sA->vy*sA->vy + sA->vz*sA->vz);
-                                        float velB = fast_sqrt(sB->vx*sB->vx + sB->vy*sB->vy + sB->vz*sB->vz);
-                                        float maxVel = (velA > velB) ? velA : velB;
-                                        if (maxVel > MAX_VELOCITY) {
-                                            MAX_VELOCITY = maxVel;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+/* ---------------------------------------------------------------------------
+   Collision Resolution using Octree
+   Instead of building a spatial hash grid, we now call the octree-based routine.
+   --------------------------------------------------------------------------- */
+ 
+// In applyPhysics(), we now call resolveCollisionsOctree (declared in octree.h)
+// which builds the octree, queries neighbors, and resolves collisions.
+ 
+/* Update physics:
+   1. Update each sphere’s position/velocity.
+   2. Handle wall collisions.
+   3. Resolve collisions using the octree.
+*/
+void applyPhysics() {
+    for (int i = 0; i < numSpheres; i++) {
+        if (!isDragged(i)) {
+            updateSphere(&spheres[i], TIME_STEP);
+            handleWallCollisions(&spheres[i]);
         }
     }
+    resolveCollisionsOctree(spheres, numSpheres);
 }
 
 void handleWallCollisions(Sphere *s) {
@@ -265,7 +192,6 @@ float getOriginDepth() {
     return (float)winZ;
 }
 
-
 bool isDragged(int index) {
     for (int i = 0; i < numDragged; i++) {
         if (draggedIndices[i] == index)
@@ -274,37 +200,21 @@ bool isDragged(int index) {
     return false;
 }
 
-
-/* Update physics:
-1. Update each sphere’s position/velocity.
-2. Handle wall collisions.
-3. Resolve collisions using spatial partitioning.
-*/
-void applyPhysics() {
-    for (int i = 0; i < numSpheres; i++) {
-        if (!isDragged(i)) {
-            updateSphere(&spheres[i], TIME_STEP);
-            handleWallCollisions(&spheres[i]);
-        }
-    }
-    resolveCollisionsSpatial();
-}
-
 void drawTransparentWalls() {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(0.5f, 0.5f, 0.8f, WALL_TRANSPARENCY);
     
     glBegin(GL_QUADS);
-    glVertex3f(-BOUNDARY, -BOUNDARY, -BOUNDARY);
-    glVertex3f(-BOUNDARY,  BOUNDARY, -BOUNDARY);
-    glVertex3f(-BOUNDARY,  BOUNDARY,  BOUNDARY);
-    glVertex3f(-BOUNDARY, -BOUNDARY,  BOUNDARY);
-    
-    glVertex3f( BOUNDARY, -BOUNDARY, -BOUNDARY);
-    glVertex3f( BOUNDARY,  BOUNDARY, -BOUNDARY);
-    glVertex3f( BOUNDARY,  BOUNDARY,  BOUNDARY);
-    glVertex3f( BOUNDARY, -BOUNDARY,  BOUNDARY);
+        glVertex3f(-BOUNDARY, -BOUNDARY, -BOUNDARY);
+        glVertex3f(-BOUNDARY,  BOUNDARY, -BOUNDARY);
+        glVertex3f(-BOUNDARY,  BOUNDARY,  BOUNDARY);
+        glVertex3f(-BOUNDARY, -BOUNDARY,  BOUNDARY);
+        
+        glVertex3f( BOUNDARY, -BOUNDARY, -BOUNDARY);
+        glVertex3f( BOUNDARY,  BOUNDARY, -BOUNDARY);
+        glVertex3f( BOUNDARY,  BOUNDARY,  BOUNDARY);
+        glVertex3f( BOUNDARY, -BOUNDARY,  BOUNDARY);
     glEnd();
     
     glDisable(GL_BLEND);
@@ -329,7 +239,8 @@ void drawMenu() {
     drawText("1 - ", 70, 170);
     drawText("2 - ", 70, 140);
     drawText("3 - ", 70, 110);
-
+    drawText("4 - ", 70, 80);
+    
     // Text options using GLUT bitmap fonts
     glColor3f(1.0f, 1.0f, 1.0f);
     
@@ -340,7 +251,7 @@ void drawMenu() {
     }
     
     glRasterPos2f(70, 140);
-    const char *opt2 = "2 - 3000 Particles";
+    const char *opt2 = "2 - 5000 Particles";
     for (const char *c = opt2; *c != '\0'; c++) {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *c);
     }
@@ -349,6 +260,29 @@ void drawMenu() {
     const char *opt3 = "3 - 8000 Particles";
     for (const char *c = opt3; *c != '\0'; c++) {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *c);
+    }
+    
+    glRasterPos2f(70, 80);
+    const char *opt4 = "4 - Color Toggle";
+    for (const char *c = opt4; *c != '\0'; c++) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, *c);
+    }
+}
+
+void toggleColor() {
+    for (int i = 0; i < numSpheres; i++) {
+        glPushMatrix();
+        glTranslatef(spheres[i].x, spheres[i].y, spheres[i].z);
+        float velocityMagnitude = fast_sqrt(spheres[i].vx * spheres[i].vx +
+                                             spheres[i].vy * spheres[i].vy +
+                                             spheres[i].vz * spheres[i].vz);
+        float velocityRatio = velocityMagnitude / MAX_VELOCITY;
+        float red = velocityRatio;
+        float blue = 1.0f - velocityRatio;
+        float green = 0.3f * (1.0f - velocityRatio);
+        glColor3f(red, green, blue);
+        glCallList(sphereList);
+        glPopMatrix();
     }
 }
 
@@ -361,8 +295,8 @@ void display() {
     float camZ = camDist * cos(camAngleX * M_PI / 180.0f) * cos(camAngleY * M_PI / 180.0f);
     
     gluLookAt(camX, camY, camZ,
-            0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0);
+              0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0);
     
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
@@ -377,22 +311,22 @@ void display() {
         glVertex3f( BOUNDARY, -BOUNDARY,  BOUNDARY);
         glVertex3f(-BOUNDARY, -BOUNDARY,  BOUNDARY);
     glEnd();
-    
-    for (int i = 0; i < numSpheres; i++) {
-        glPushMatrix();
-        glTranslatef(spheres[i].x, spheres[i].y, spheres[i].z);
-        float velocityMagnitude = fast_sqrt(spheres[i].vx * spheres[i].vx +
-                                            spheres[i].vy * spheres[i].vy +
-                                            spheres[i].vz * spheres[i].vz);
-        float velocityRatio = velocityMagnitude / MAX_VELOCITY;
-        float red = velocityRatio;
-        float blue = 1.0f - velocityRatio;
-        float green = 0.3f * (1.0f - velocityRatio);
-        glColor3f(red, green, blue);
-        glCallList(sphereList);
-        glPopMatrix();
+    if (!toggle) {
+        glClearColor(0.6, 0.8, 1.0, 1.0);
+        glEnable(GL_COLOR_MATERIAL);
+        glColorMaterial(GL_FRONT, GL_AMBIENT_AND_DIFFUSE);
+        glColor3f(1.0f, 1.0f, 0.94f);
+        glEnable(GL_LIGHTING);
+        for (int i = 0; i < numSpheres; i++) {
+            glPushMatrix();
+            glTranslatef(spheres[i].x, spheres[i].y, spheres[i].z);
+            glCallList(sphereList);
+            glPopMatrix();
+        }
     }
-    
+    else if (toggle) {
+        toggleColor();
+    }
     if (showMenu) {
         // Save current projection and modelview matrices.
         glMatrixMode(GL_PROJECTION);
@@ -410,14 +344,12 @@ void display() {
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_LIGHTING);
         
-        // Now draw the menu overlay.
+        // Draw the menu overlay.
         drawMenu();
         
-        // Re-enable depth testing and lighting if needed.
+        // Restore matrices.
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_LIGHTING);
-        
-        // Restore matrices.
         glPopMatrix();
         glMatrixMode(GL_PROJECTION);
         glPopMatrix();
@@ -426,7 +358,6 @@ void display() {
     
     glutSwapBuffers();
 }
-
 
 void idle() {
     applyPhysics();
@@ -466,13 +397,18 @@ void keyPress(unsigned char key, int x, int y) {
                 showMenu = false;
                 break;
             case '2':
-                particleCount = 3000;
+                particleCount = 5000;
                 resetSimulation();
                 showMenu = false;
                 break;
             case '3':
                 particleCount = 8000;
                 resetSimulation();
+                showMenu = false;
+                break;
+            case '4':
+                toggle = !toggle;
+                toggleColor();
                 showMenu = false;
                 break;
             case 'f': // Hide menu if already open
@@ -530,13 +466,12 @@ void mouseMotion(int x, int y) {
                 spheres[idx].x = newClumpCenter[0] + dragOffsets[i][0];
                 spheres[idx].y = newClumpCenter[1] + dragOffsets[i][1];
                 spheres[idx].z = newClumpCenter[2] + dragOffsets[i][2];
-                
-                // Optionally, reset velocities or set them based on the delta from the last frame.
+                // Reset velocities.
                 spheres[idx].vx = 0.0f;
                 spheres[idx].vy = 0.0f;
                 spheres[idx].vz = 0.0f;
             }
-            // Update the dragPlanePoint so that the next ray intersection is relative to the current clump center.
+            // Update dragPlanePoint to the new clump center.
             dragPlanePoint[0] = newClumpCenter[0];
             dragPlanePoint[1] = newClumpCenter[1];
             dragPlanePoint[2] = newClumpCenter[2];
@@ -556,7 +491,7 @@ void mouse(int button, int state, int x, int y) {
                 glGetIntegerv(GL_VIEWPORT, viewport);
                 glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
                 glGetDoublev(GL_PROJECTION_MATRIX, projection);
-                // Use the depth at the origin (where spheres are) rather than 0.5.
+                // Use depth at the origin (where spheres are) rather than 0.5.
                 float depth = getOriginDepth();
                 gluUnProject(x, viewport[3]-y, depth, modelview, projection, viewport, &wx, &wy, &wz);
                 clickX = (float)wx; 
@@ -590,15 +525,14 @@ void mouse(int button, int state, int x, int y) {
                 clumpCenter[1] /= numDragged;
                 clumpCenter[2] /= numDragged;
                 
-                // Store the clump center as the drag plane point.
+                // Store clump center as the drag plane point.
                 dragPlanePoint[0] = clumpCenter[0];
                 dragPlanePoint[1] = clumpCenter[1];
                 dragPlanePoint[2] = clumpCenter[2];
                 
-                // Set the drag plane normal as the (normalized) camera view direction.
+                // Set the drag plane normal as the normalized camera view direction.
                 float camPos[3];
                 getCameraPosition(camPos);
-                // Since the camera is looking at the origin, the view vector is (origin - camPos).
                 float viewVec[3] = { -camPos[0], -camPos[1], -camPos[2] };
                 float len = fast_sqrt(viewVec[0]*viewVec[0] + viewVec[1]*viewVec[1] + viewVec[2]*viewVec[2]);
                 if (len > 0) {
@@ -632,6 +566,6 @@ void init() {
     initializeSpheres();
     sphereList = glGenLists(1);
     glNewList(sphereList, GL_COMPILE);
-    glutSolidSphere(SPHERE_RADIUS, 20, 20);
+        glutSolidSphere(SPHERE_RADIUS, 20, 20);
     glEndList();
 }
