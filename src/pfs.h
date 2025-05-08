@@ -5,7 +5,7 @@
 #include "particles.h"
 
 #define MAX_SPHERES_PER_CELL 100000000000
-#define GRID_RES 10000000
+#define GRID_RES 10000
 #define CELL_SIZE ((BOUNDARY * 2.0f) / GRID_RES)
 #define M_PI 3.14159265358979323846
 #define GRAVITY         -0.8f
@@ -15,7 +15,7 @@
 #define WALL_TRANSPARENCY 0.3f
 
 // Total number of spheres = GRID_SIZE^3
-#define GRID_SIZE       200000
+#define GRID_SIZE       20
 #define SPACING         0.001f
 #define BOUNDARY        3.9f
 #define MAX_SPHERES (GRID_SIZE * GRID_SIZE * GRID_SIZE)

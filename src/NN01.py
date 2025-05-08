@@ -198,7 +198,7 @@ dataloader = DataLoader(combined_dataset, batch_size=8, shuffle=True)
 # -------------------------------
 criterion = nn.MSELoss()
 optimizer = optim.Adam(full_model.parameters(), lr=0.001)
-num_epochs = 10
+num_epochs = 1
 
 print("Starting training...")
 for epoch in range(num_epochs):
